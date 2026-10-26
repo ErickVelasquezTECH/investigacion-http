@@ -1,4 +1,5 @@
 
+import hmac
 import ipaddress
 import json
 import os
@@ -8,7 +9,7 @@ import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 LOG = Path(os.environ.get("LOG_FILE", "requests.jsonl"))
 MAX_BODY_SIZE = 32_768
@@ -124,8 +125,9 @@ def normalizar_ip(ip):
 
 
 def registrar(evento):
-    """Añade un evento JSON por línea, serializado entre hilos."""
+    """Imprime en stdout (pestaña Logs de Render) y guarda en archivo."""
     linea = json.dumps(evento, ensure_ascii=False)
+    print(linea, flush=True)
 
     with LOG_LOCK:
         with LOG.open("a", encoding="utf-8") as archivo:
@@ -137,13 +139,26 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "DiagnosticServer"
     sys_version = ""
 
-    def registrar_peticion(self, datos_cliente=None):
-        ip = normalizar_ip(self.client_address[0])
+    def ip_cliente(self):
+        """IP real del visitante: detrás de Render llega por cabeceras."""
+        for h in ("CF-Connecting-IP", "True-Client-IP"):
+            v = self.headers.get(h)
+            if v:
+                return v.strip()
 
+        xff = self.headers.get("X-Forwarded-For")
+        if xff:
+            return xff.split(",")[0].strip()
+
+        return self.client_address[0]
+
+    def registrar_peticion(self, datos_cliente=None):
         evento = {
             "id": str(uuid.uuid4()),
             "timestamp_utc": ahora_utc(),
-            "ip_observada": ip,
+            "ip_observada": normalizar_ip(self.ip_cliente()),
+            "x_forwarded_for": self.headers.get("X-Forwarded-For"),
+            "cf_connecting_ip": self.headers.get("CF-Connecting-IP"),
             "metodo": self.command,
             "ruta": urlparse(self.path).path,
             "user_agent": self.headers.get("User-Agent"),
@@ -166,18 +181,43 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
         try:
-            self.wfile.write(cuerpo)
+            if self.command != "HEAD":
+                self.wfile.write(cuerpo)
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    def do_HEAD(self):
+        # Para monitores tipo UptimeRobot: no se registra nada.
+        self.responder(200, "ok", "text/plain; charset=utf-8")
+
     def do_GET(self):
-        ruta = urlparse(self.path).path
+        partes = urlparse(self.path)
+        ruta = partes.path
+
+        # Endpoint de salud para mantener el servicio despierto (no se registra).
+        if ruta == "/health":
+            self.responder(200, "ok", "text/plain; charset=utf-8")
+            return
+
+        # Descarga protegida del archivo de registros (no se registra).
+        if ruta == "/logs":
+            token = parse_qs(partes.query).get("token", [""])[0]
+            esperado = os.environ.get("LOG_TOKEN", "")
+
+            if esperado and hmac.compare_digest(token, esperado):
+                contenido = (
+                    LOG.read_text(encoding="utf-8") if LOG.exists() else ""
+                )
+                self.responder(200, contenido, "text/plain; charset=utf-8")
+            else:
+                self.responder(
+                    404, "No encontrado", "text/plain; charset=utf-8"
+                )
+            return
 
         if ruta != "/":
             self.responder(
-                404,
-                "No encontrado",
-                "text/plain; charset=utf-8"
+                404, "No encontrado", "text/plain; charset=utf-8"
             )
             return
 
@@ -187,9 +227,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if urlparse(self.path).path != "/telemetry":
             self.responder(
-                404,
-                "No encontrado",
-                "text/plain; charset=utf-8"
+                404, "No encontrado", "text/plain; charset=utf-8"
             )
             return
 
@@ -230,7 +268,7 @@ class Handler(BaseHTTPRequestHandler):
             )
 
     def log_message(self, formato, *args):
-        # Los eventos se guardan en el archivo JSONL.
+        # Los eventos se guardan en el archivo JSONL y en stdout.
         pass
 
 
@@ -238,8 +276,8 @@ if __name__ == "__main__":
     puerto = int(os.environ.get("PORT", "8080"))
     servidor = ThreadingHTTPServer(("0.0.0.0", puerto), Handler)
 
-    print(f"Servidor escuchando en el puerto {puerto}")
-    print(f"Archivo de registros: {LOG.resolve()}")
+    print(f"Servidor escuchando en el puerto {puerto}", flush=True)
+    print(f"Archivo de registros: {LOG.resolve()}", flush=True)
 
     try:
         servidor.serve_forever()
